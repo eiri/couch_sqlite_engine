@@ -28,4 +28,4 @@ _TBD: Write basic CRUD steps for `curl` with `engine` attribute_
 
 ## License
 
-[Apache License 2.0](https://raw.githubusercontent.com/eiri/couchdb_pse_sqlite/master/LICENSE "Apache License 2.0")
+[Apache License 2.0](https://raw.githubusercontent.com/eiri/couch_sqlite_engine/master/LICENSE "Apache License 2.0")
