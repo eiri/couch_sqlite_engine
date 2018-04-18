@@ -25,12 +25,21 @@ setup-eunit: couchdb/tmp/etc/default_eunit.ini
 deps/couch:
 	@mkdir -p $(PWD)/deps; cd $(PWD)/deps; ln -s ../couchdb/src/couch
 
-.PHONY: compile
-compile: compile-couch deps/couch ## compile the engine
+.PHONY: all
+all: compile-couch deps/couch ## compile the engine
 	@$(REBAR) compile
 
-.PHONY: test
-test: export BUILDDIR = $(COUCHDIR)
-test: export ERL_AFLAGS = "-config $(COUCHDIR)/rel/files/eunit.config"
-test: compile setup-eunit ## run eunit tests
+.PHONY: check
+check: export BUILDDIR = $(COUCHDIR)
+check: export ERL_AFLAGS = "-config $(COUCHDIR)/rel/files/eunit.config"
+check: all setup-eunit ## run eunit tests
 	@$(REBAR) eunit skip_deps=true
+
+.PHONY: clean
+clean: ## remove compiled files
+	@$(REBAR) clean skip_deps=true
+
+.PHONY: distclean
+distclean: clean ## remove all generated files
+	@rm -f $(PWD)/deps/couch
+	@cd $(COUCHDIR); make distclean
