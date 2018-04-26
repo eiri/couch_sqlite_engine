@@ -72,6 +72,7 @@
 
 -include("couch_sqlite_engine.hrl").
 
+-include_lib("couch/include/couch_db.hrl").
 
 % This is called by couch_server to determine which
 % engine should be used for the given database. DbPath
@@ -153,23 +154,17 @@ init_state(#st{ref = Ref} = St, Opts) ->
     ok = esqlite3:exec("begin;", Ref),
     lists:foreach(fun(Q) -> ok = esqlite3:exec(Q, Ref) end, [
         "create table if not exists meta(key text primary key, value blob);",
-        "create table if not exists id(key text primary key, value blob);",
+        "create table if not exists idx(key text primary key, value blob);",
         "create table if not exists seq(key text primary key, value blob);",
-        "create table if not exists local(key text primary key, value blob);",
-        "create table if not exists docs(key text primary key, value blob);"
+        "create table if not exists loc(key text primary key, value blob);",
+        "create table if not exists doc(key text primary key, value blob);"
     ]),
     ok = esqlite3:exec("commit;", Ref),
 
     %% maybe update security
-    {ok, MetaQ} = esqlite3:prepare("insert into meta values(?1, ?2)", Ref),
-    ok = esqlite3:exec("select 1 from meta where key='security';", Ref),
-    case esqlite3:changes(Ref) of
-        {ok, 1} -> ok;
-        {ok, 0} ->
-            DSO = couch_util:get_value(default_security_object, Opts, []),
-            esqlite3:bind(MetaQ, ["security", term_to_binary(DSO)]),
-            esqlite3:step(MetaQ)
-    end,
+    MetaQ = "insert or ignore into meta values(?1, ?2)",
+    DSO = couch_util:get_value(default_security_object, Opts, []),
+    esqlite3:exec(MetaQ, ["security", term_to_binary(DSO)], Ref),
 
     %% read or set meta
     case esqlite3:q("select value from meta where key='meta'", Ref) of
@@ -183,8 +178,7 @@ init_state(#st{ref = Ref} = St, Opts) ->
                 {update_seq, 0},
                 {epochs, [{node(), 0}]}
             ],
-            esqlite3:bind(MetaQ, ["meta", term_to_binary(DefaultMeta)]),
-            esqlite3:step(MetaQ),
+            esqlite3:exec(MetaQ, ["meta", term_to_binary(DefaultMeta)], Ref),
             {ok, St#st{meta = DefaultMeta}};
         [{MetaBin}] ->
             Meta = binary_to_term(MetaBin),
@@ -338,9 +332,16 @@ set_security(#st{ref = Ref} = St, SecProps) ->
 % were present in the database when the DbHandle was retrieved
 % from couch_server. It is currently unknown what would break
 % if a storage engine deviated from that property.
-open_docs(#st{} = _St, _DocIds) ->
-    %% #full_doc_info{}
-    not_found.
+open_docs(#st{ref = Ref}, DocIds) ->
+    {ok, Q} = esqlite3:prepare("select value from idx where key = ?1", Ref),
+    lists:map(fun(DocId) ->
+        esqlite3:bind(Q, [DocId]),
+        case esqlite3:step(Q) of
+            '$done' -> not_found;
+            {row, {FDI}} -> binary_to_term(FDI);
+            {error, E} -> throw(E)
+        end
+    end, DocIds).
 
 % This function will be called by many processes concurrently.
 % It should return a #doc{} record or not_found for every
@@ -350,9 +351,16 @@ open_docs(#st{} = _St, _DocIds) ->
 % apply to this function (although this function is called
 % rather less frequently so it may not be as big of an
 % issue).
-open_local_docs(#st{} = _St, _DocIds) ->
-    %% #doc{}
-    not_found.
+open_local_docs(#st{ref = Ref}, DocIds) ->
+    {ok, Q} = esqlite3:prepare("select value from loc where key = ?1", Ref),
+    lists:map(fun(DocId) ->
+        esqlite3:bind(Q, [DocId]),
+        case esqlite3:step(Q) of
+            '$done' -> not_found;
+            {row, {Doc}} -> binary_to_term(Doc);
+            {error, E} -> throw(E)
+        end
+    end, DocIds).
 
 % This function will be called from many contexts concurrently.
 % The provided RawDoc is a #doc{} record that has its body
@@ -361,8 +369,12 @@ open_local_docs(#st{} = _St, _DocIds) ->
 % This API exists so that storage engines can store document
 % bodies externally from the #full_doc_info{} record (which
 % is the traditional approach and is recommended).
-read_doc_body(#st{} = _St, RawDoc) ->
-    RawDoc.
+read_doc_body(#st{ref = Ref}, #doc{body = Md5} = Doc) ->
+    Key = couch_util:to_hex(Md5),
+    [{Data}] = esqlite3:q("select value from doc where key=?1", [Key], Ref),
+    Md5 = crypto:hash(md5, Data),
+    {Body, Atts} = binary_to_term(Data),
+    Doc#doc{body = Body, atts = Atts}.
 
 % This function is called concurrently by any client process
 % that is writing a document. It should accept a #doc{}
@@ -373,8 +385,10 @@ read_doc_body(#st{} = _St, RawDoc) ->
 % document bodies in parallel by client processes rather
 % than forcing all compression to occur single threaded
 % in the context of the couch_db_updater process.
-serialize_doc(#st{} = _St, Doc) ->
-    Doc.
+serialize_doc(#st{} = _St, #doc{body = Body, atts = Atts} = Doc) ->
+    Data = term_to_binary({Body, Atts}),
+    Md5 = crypto:hash(md5, Data),
+    Doc#doc{body = {Md5, Data}}.
 
 % This function is called in the context of a couch_db_updater
 % which means its single threaded for the given DbHandle.
@@ -387,8 +401,12 @@ serialize_doc(#st{} = _St, Doc) ->
 % The BytesWritten return value is used to determine the number
 % of active bytes in the database which can is used to make
 % a determination of when to compact this database.
-write_doc_body(#st{} = _St, Doc) ->
-    {ok, Doc, 0}.
+write_doc_body(#st{ref = Ref}, #doc{body = {Md5, Data}} = Doc) ->
+    Key = couch_util:to_hex(Md5),
+    ActiveSize = byte_size(Data),
+    InsertDoc = "insert or ignore into doc values(?1, ?2);",
+    '$done' = esqlite3:exec(InsertDoc, [Key, Data], Ref),
+    {ok, Doc#doc{body = Md5}, ActiveSize}.
 
 % This function is called from the context of couch_db_updater
 % and as such is guaranteed single threaded for the given
@@ -434,8 +452,84 @@ write_doc_body(#st{} = _St, Doc) ->
 % not be an issue as it has never been a guarantee and the
 % batches are non-deterministic (from the point of view of the
 % client).
-write_doc_infos(#st{} = St, _Pairs, _LocalDocs, _PurgedDocIdRevs) ->
-    {ok, St}.
+write_doc_infos(#st{ref = Ref} = St, Pairs, LocalDocs, _PurgedDocIdRevs) ->
+    DocCount = ?MODULE:get_doc_count(St),
+    DelDocCount = ?MODULE:get_del_doc_count(St),
+    UpdateSeq = ?MODULE:get_update_seq(St),
+    InsertIdx = "insert into idx values(?1, ?2);",
+    InsertSeq = "insert into seq values(?1, ?2);",
+    UpdateIdx = "update idx set value = ?2 where key = ?1;",
+    DeleteIdx = "delete from idx where key = ?1;",
+    DeleteSeq = "delete from seq where key = ?1;",
+    {NewDocCount, NewDelDocCount, NewUpdateSeq} = lists:foldl(fun
+        %% create
+        ({not_found, NewFDI}, Acc) ->
+            {DC, DDC, Seq} = Acc,
+            #full_doc_info{id = DocId, update_seq = NewSeq} = NewFDI,
+            V = term_to_binary(NewFDI),
+            esqlite3:exec(InsertIdx, [DocId, V], Ref),
+            esqlite3:exec(InsertSeq, [NewSeq, V], Ref),
+            {DC + 1, DDC, erlang:max(NewSeq, Seq)};
+        %% purge
+        ({OldFDI, not_found}, Acc) ->
+            {DC, DDC, Seq} = Acc,
+            #full_doc_info{id = DocId, update_seq = OldSeq} = OldFDI,
+            esqlite3:exec(DeleteIdx, [DocId], Ref),
+            esqlite3:exec(DeleteSeq, [OldSeq], Ref),
+            {DC - 1, DDC + 1, Seq};
+        %% update, delete
+        ({OldFDI, NewFDI}, Acc) ->
+            {DC, DDC, Seq} = Acc,
+            #full_doc_info{id = DocId, update_seq = OldSeq} = OldFDI,
+            #full_doc_info{id = DocId, update_seq = NewSeq} = NewFDI,
+            V = term_to_binary(NewFDI),
+            esqlite3:exec(UpdateIdx, [DocId, V], Ref),
+            esqlite3:exec(InsertSeq, [NewSeq, V], Ref),
+            esqlite3:exec(DeleteSeq, [OldSeq], Ref), %% is this correct?
+            case NewFDI#full_doc_info.deleted of
+                true ->
+                    {DC - 1, DDC + 1, erlang:max(NewSeq, Seq)};
+                false ->
+                    {DC, DDC, erlang:max(NewSeq, Seq)}
+            end
+    end, {DocCount, DelDocCount, UpdateSeq}, Pairs),
+
+    %% deal with locals
+    CheckLoc = "select exists(select 1 from loc where key=?1);",
+    InsertLoc = "insert into loc values(?1, ?2);",
+    UpdateLoc = "update loc set value = ?2 where key = ?1;",
+    DeleteLoc = "delete from loc where key = ?1;",
+    lists:foreach(fun
+        %% delete
+        (#doc{id = DocId, deleted = true}) ->
+            esqlite3:exec(DeleteLoc, [DocId], Ref);
+        (#doc{id = DocId} = Doc0) ->
+            {0, [RevInt | _]} = Doc0#doc.revs,
+            RevBin = integer_to_binary(RevInt),
+            Doc = Doc0#doc{revs = {0, [RevBin]}},
+            V = term_to_binary(Doc),
+            case esqlite3:q(CheckLoc, [DocId], Ref) of
+                %% update
+                [{1}] ->
+                    esqlite3:exec(UpdateLoc, [DocId, V], Ref);
+                %% create
+                [{0}] ->
+                    esqlite3:exec(InsertLoc, [DocId, V], Ref)
+            end
+    end, LocalDocs),
+
+    %% meta
+    NewMetaValues = [
+        {doc_count, NewDocCount},
+        {del_doc_count, NewDelDocCount},
+        {update_seq, NewUpdateSeq}
+    ],
+    NewMeta = lists:foldl(fun({Key, Value}, Acc) ->
+        lists:keyreplace(Key, 1, Acc, {Key, Value})
+    end, St#st.meta, NewMetaValues),
+    UpdateMeta = "update meta set value = ?1 where key = 'meta';",
+    esqlite3:exec(UpdateMeta, [term_to_binary(NewMeta)], Ref),
+    {ok, St#st{meta = NewMeta}}.
 
 % This function is called in the context of couch_db_udpater and
 % as such is single threaded for any given DbHandle.
