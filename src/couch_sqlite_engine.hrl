@@ -11,5 +11,7 @@
 % the License.
 
 -record(st, {
-    fd
+    filepath,
+    ref,
+    meta
 }).

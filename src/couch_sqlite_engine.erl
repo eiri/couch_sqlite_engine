@@ -79,8 +79,8 @@
 % extension for a given engine. The first engine to
 % return true is the engine that will be used for the
 % database.
-exists(_DbPath) ->
-    false.
+exists(DbPath) ->
+    filelib:is_file(DbPath).
 
 % This is called by couch_server to delete a database. It
 % is called from inside the couch_server process which
@@ -88,8 +88,9 @@ exists(_DbPath) ->
 % its own consistency checks when executing in this
 % context. Although since this is executed in the context
 % of couch_server it should return relatively quickly.
-delete(_RootDir, _DbPath, _DelOpts) ->
-    ok.
+delete(RootDir, DbPath, DelOpts) ->
+    %% TODO Call through db_updater to close DB first
+    couch_file:delete(RootDir, DbPath, DelOpts).
 
 % This function can be called from multiple contexts. It
 % will either be called just before a call to delete/3 above
@@ -114,15 +115,81 @@ delete_compaction_files(_RootDir, _DbPath, _DelOpts) ->
 % its guaranteed that the handle will only ever be mutated
 % in a single threaded context (ie, within the couch_db_updater
 % process).
-init(_DbPath, _DbOpenOpts) ->
-    {ok, #st{}}.
+init(DbPath, DbOpenOpts) ->
+    Create = lists:member(create, DbOpenOpts),
+    Exists = ?MODULE:exists(DbPath),
+    case {Create, Exists} of
+        {false, false} ->
+            throw({not_found, no_db_file});
+        {true, true} ->
+            case lists:member(overwrite, DbOpenOpts) of
+                true ->
+                    RootDir = filename:dirname(DbPath),
+                    DelOpts = [sync, {context, delete}],
+                    ?MODULE:delete(RootDir, DbPath, DelOpts);
+                false ->
+                    throw({error, eexist})
+            end;
+        _ -> ok
+    end,
+    case esqlite3:open(DbPath) of
+        {ok, Ref} ->
+            St = #st{filepath = DbPath, ref = Ref},
+            init_state(St, DbOpenOpts);
+        {error, Error} ->
+            throw(Error)
+    end.
 
 % This is called in the context of couch_db_updater:terminate/2
 % and as such has the same properties for init/2. It's guaranteed
 % to be consistent for a given database but may be called by many
 % databases concurrently.
-terminate(_Reason, #st{} = _St) ->
+terminate(_Reason, #st{} = St) ->
+    esqlite3:close(St#st.ref),
     ok.
+
+init_state(#st{ref = Ref} = St, Opts) ->
+    %% prepare working tables
+    ok = esqlite3:exec("begin;", Ref),
+    lists:foreach(fun(Q) -> ok = esqlite3:exec(Q, Ref) end, [
+        "create table if not exists meta(key text primary key, value blob);",
+        "create table if not exists id(key text primary key, value blob);",
+        "create table if not exists seq(key text primary key, value blob);",
+        "create table if not exists local(key text primary key, value blob);",
+        "create table if not exists docs(key text primary key, value blob);"
+    ]),
+    ok = esqlite3:exec("commit;", Ref),
+
+    %% maybe update security
+    {ok, MetaQ} = esqlite3:prepare("insert into meta values(?1, ?2)", Ref),
+    ok = esqlite3:exec("select 1 from meta where key='security';", Ref),
+    case esqlite3:changes(Ref) of
+        {ok, 1} -> ok;
+        {ok, 0} ->
+            DSO = couch_util:get_value(default_security_object, Opts, []),
+            esqlite3:bind(MetaQ, ["security", term_to_binary(DSO)]),
+            esqlite3:step(MetaQ)
+    end,
+
+    %% read or set meta
+    case esqlite3:q("select value from meta where key='meta'", Ref) of
+        [] ->
+            DefaultMeta = [
+                {disk_version, 1},
+                {revs_limit, 1000},
+                {uuid, couch_uuids:random()},
+                {doc_count, 0},
+                {del_doc_count, 0},
+                {update_seq, 0},
+                {epochs, [{node(), 0}]}
+            ],
+            esqlite3:bind(MetaQ, ["meta", term_to_binary(DefaultMeta)]),
+            esqlite3:step(MetaQ),
+            {ok, St#st{meta = DefaultMeta}};
+        [{MetaBin}] ->
+            Meta = binary_to_term(MetaBin),
+            {ok, St#st{meta = Meta}}
+    end.
 
 % This is called in the context of couch_db_updater:handle_call/3
 % for any message that is unknown. It can be used to handle messages
