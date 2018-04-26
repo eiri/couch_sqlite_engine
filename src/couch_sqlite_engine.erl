@@ -235,18 +235,21 @@ get_compacted_seq(#st{} = _St) ->
 
 % The number of documents in the database which have all leaf
 % revisions marked as deleted.
-get_del_doc_count(#st{} = _St) ->
-    0.
+get_del_doc_count(#st{meta = Meta}) ->
+    {del_doc_count, DelDocCount} = lists:keyfind(del_doc_count, 1, Meta),
+    DelDocCount.
 
 % This number is reported in the database info properties and
 % as such can be any JSON value.
-get_disk_version(#st{} = _St) ->
-    1.
+get_disk_version(#st{meta = Meta}) ->
+    {disk_version, DiskVersion} = lists:keyfind(disk_version, 1, Meta),
+    DiskVersion.
 
 % The number of documents in the database that have one or more
 % leaf revisions not marked as deleted.
-get_doc_count(#st{} = _St) ->
-    0.
+get_doc_count(#st{meta = Meta}) ->
+    {doc_count, DocCount} = lists:keyfind(doc_count, 1, Meta),
+    DocCount.
 
 % The epochs track which node owned the database starting at
 % a given update sequence. Each time a database is opened it
@@ -254,12 +257,13 @@ get_doc_count(#st{} = _St) ->
 % for the current node it should add an entry that will be
 % written the next time a write is performed. An entry is
 % simply a {node(), CurrentUpdateSeq} tuple.
-get_epochs(#st{} = _St) ->
-    [{node(), 0}].
+get_epochs(#st{meta = Meta}) ->
+    {epochs, Epochs} = lists:keyfind(epochs, 1, Meta),
+    Epochs.
 
 % Get the last purge request performed.
 get_last_purged(#st{} = _St) ->
-    0.
+    [].
 
 % Get the current purge sequence. This should be incremented
 % for every purge operation.
@@ -268,13 +272,16 @@ get_purge_seq(#st{} = _St) ->
 
 % Get the revision limit. This should just return the last
 % value that was passed to set_revs_limit/2.
-get_revs_limit(#st{} = _St) ->
-    1.
+get_revs_limit(#st{meta = Meta}) ->
+    {revs_limit, RevsLimit} = lists:keyfind(revs_limit, 1, Meta),
+    RevsLimit.
 
 % Get the current security properties. This should just return
 % the last value that was passed to set_security/2.
-get_security(#st{} = _St) ->
-    [].
+get_security(#st{ref = Ref}) ->
+    Q = "select value from meta where key='security'",
+    [{SecPropsBin}] = esqlite3:q(Q, Ref),
+    binary_to_term(SecPropsBin).
 
 % This information is displayed in the database info poperties. It
 % should just be a list of {Name::atom(), Size::non_neg_integer()}
@@ -295,24 +302,35 @@ get_size_info(#st{} = _St) ->
 % The current update sequence of the database. The update
 % sequence should be incrememnted for every revision added to
 % the database.
-get_update_seq(#st{} = _St) ->
-    0.
+get_update_seq(#st{meta = Meta}) ->
+    {update_seq, UpdateSeq} = lists:keyfind(update_seq, 1, Meta),
+    UpdateSeq.
 
 % Whenever a database is created it should generate a
 % persistent UUID for identification in case the shard should
 % ever need to be moved between nodes in a cluster.
-get_uuid(#st{} = _St) ->
-    couch_uuids:random().
+get_uuid(#st{meta = Meta}) ->
+    {uuid, UUID} = lists:keyfind(uuid, 1, Meta),
+    UUID.
 
 % These functions are only called by couch_db_updater and
 % as such are guaranteed to be single threaded calls. The
 % database should simply store these values somewhere so
 % they can be returned by the corresponding get_* calls.
 
-set_revs_limit(#st{} = St, _RevsLimit) ->
-    {ok, St}.
+set_revs_limit(#st{ref = Ref, meta = Meta0} = St, RevsLimit) ->
+    Meta = lists:keyreplace(revs_limit, 1, Meta0, {revs_limit, RevsLimit}),
+    Q = "update meta set value = ?1 where key = 'meta';",
+    {ok, Stmt} = esqlite3:prepare(Q, Ref),
+    esqlite3:bind(Stmt, [term_to_binary(Meta)]),
+    esqlite3:step(Stmt),
+    {ok, St#st{meta = Meta}}.
 
-set_security(#st{} = St, _SecProps) ->
+set_security(#st{ref = Ref} = St, SecProps) ->
+    Q = "update meta set value = ?1 where key = 'security';",
+    {ok, Stmt} = esqlite3:prepare(Q, Ref),
+    esqlite3:bind(Stmt, [term_to_binary(SecProps)]),
+    esqlite3:step(Stmt),
     {ok, St}.
 
 % This function will be called by many processes concurrently.
