@@ -321,16 +321,12 @@ get_uuid(#st{meta = Meta}) ->
 set_revs_limit(#st{ref = Ref, meta = Meta0} = St, RevsLimit) ->
     Meta = lists:keyreplace(revs_limit, 1, Meta0, {revs_limit, RevsLimit}),
     Q = "update meta set value = ?1 where key = 'meta';",
-    {ok, Stmt} = esqlite3:prepare(Q, Ref),
-    esqlite3:bind(Stmt, [term_to_binary(Meta)]),
-    esqlite3:step(Stmt),
+    '$done' = esqlite3:exec(Q, [term_to_binary(Meta)], Ref),
     {ok, St#st{meta = Meta}}.
 
 set_security(#st{ref = Ref} = St, SecProps) ->
     Q = "update meta set value = ?1 where key = 'security';",
-    {ok, Stmt} = esqlite3:prepare(Q, Ref),
-    esqlite3:bind(Stmt, [term_to_binary(SecProps)]),
-    esqlite3:step(Stmt),
+    '$done' = esqlite3:exec(Q, [term_to_binary(SecProps)], Ref),
     {ok, St}.
 
 % This function will be called by many processes concurrently.
