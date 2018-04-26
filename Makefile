@@ -25,8 +25,11 @@ setup-eunit: couchdb/tmp/etc/default_eunit.ini
 deps/couch:
 	@mkdir -p $(PWD)/deps; cd $(PWD)/deps; ln -s ../couchdb/src/couch
 
+deps/esqlite:
+	@$(REBAR) get-deps
+
 .PHONY: all
-all: compile-couch deps/couch ## compile the engine
+all: compile-couch deps/couch deps/esqlite ## compile the engine
 	@$(REBAR) compile
 
 .PHONY: check
