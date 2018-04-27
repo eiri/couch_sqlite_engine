@@ -154,6 +154,7 @@ init_state(#st{ref = Ref} = St, Opts) ->
     ok = esqlite3:exec("begin;", Ref),
     lists:foreach(fun(Q) -> ok = esqlite3:exec(Q, Ref) end, [
         "create table if not exists meta(key text primary key, value blob);",
+        "create table if not exists sec(key text primary key, value blob);",
         "create table if not exists idx(key text primary key, value blob);",
         "create table if not exists seq(key text primary key, value blob);",
         "create table if not exists loc(key text primary key, value blob);",
@@ -162,9 +163,9 @@ init_state(#st{ref = Ref} = St, Opts) ->
     ok = esqlite3:exec("commit;", Ref),
 
     %% maybe update security
-    MetaQ = "insert or ignore into meta values(?1, ?2)",
+    SecQ = "insert or ignore into sec values(?1, ?2)",
     DSO = couch_util:get_value(default_security_object, Opts, []),
-    esqlite3:exec(MetaQ, ["security", term_to_binary(DSO)], Ref),
+    esqlite3:exec(SecQ, ["sec", term_to_binary(DSO)], Ref),
 
     %% read or set meta
     case esqlite3:q("select value from meta where key='meta'", Ref) of
@@ -178,6 +179,7 @@ init_state(#st{ref = Ref} = St, Opts) ->
                 {update_seq, 0},
                 {epochs, [{node(), 0}]}
             ],
+            MetaQ = "insert or ignore into meta values(?1, ?2)",
             esqlite3:exec(MetaQ, ["meta", term_to_binary(DefaultMeta)], Ref),
             {ok, St#st{meta = DefaultMeta}};
         [{MetaBin}] ->
@@ -273,7 +275,7 @@ get_revs_limit(#st{meta = Meta}) ->
 % Get the current security properties. This should just return
 % the last value that was passed to set_security/2.
 get_security(#st{ref = Ref}) ->
-    Q = "select value from meta where key='security'",
+    Q = "select value from sec where key='sec'",
     [{SecPropsBin}] = esqlite3:q(Q, Ref),
     binary_to_term(SecPropsBin).
 
@@ -319,7 +321,7 @@ set_revs_limit(#st{ref = Ref, meta = Meta0} = St, RevsLimit) ->
     {ok, St#st{meta = Meta}}.
 
 set_security(#st{ref = Ref} = St, SecProps) ->
-    Q = "update meta set value = ?1 where key = 'security';",
+    Q = "update sec set value = ?1 where key = 'sec';",
     '$done' = esqlite3:exec(Q, [term_to_binary(SecProps)], Ref),
     {ok, St}.
 
