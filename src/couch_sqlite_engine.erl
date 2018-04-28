@@ -613,18 +613,96 @@ is_active_stream(#st{} = _St, _ReadStreamState) ->
 % updates happening. However there doesn't seem to be any instance of
 % that actually happening so a storage engine that includes new results
 % between invocations shouldn't have any issues.
-fold_docs(#st{} = _St, _UserFold, _UserAcc, _DocFoldOpts) ->
-    LastUserAcc = [],
-    {ok, LastUserAcc}.
+fold_docs(St, UserFold, UserAcc, DocFoldOpts) ->
+    fold_docs_int(St, "idx", UserFold, UserAcc, DocFoldOpts).
 
 % This function may be called by many processes concurrently.
 %
 % This should behave exactly the same as fold_docs/4 except that it
 % should only return local documents and the first argument to the
 % user function is a #doc{} record, not a #full_doc_info{}.
-fold_local_docs(#st{} = _St, _UserFold, _UserAcc, _DocFoldOpts) ->
-    LastUserAcc = [],
-    {ok, LastUserAcc}.
+fold_local_docs(St, UserFold, UserAcc, DocFoldOpts) ->
+    fold_docs_int(St, "loc", UserFold, UserAcc, DocFoldOpts).
+
+
+fold_docs_int(#st{ref = Ref}, Tab, UserFold, UserAcc, DocFoldOpts) ->
+    {ok, Where, Bind} = get_where_query(DocFoldOpts),
+    Query = io_lib:format("select value from ~s ~s", [Tab, Where]),
+    {ok, Stmt} = esqlite3:prepare(Query, Ref),
+    if Bind == [] -> ok; true -> esqlite3:bind(Stmt, Bind) end,
+    Step = esqlite3:step(Stmt),
+    %% maybe: {arity, UserFoldArity} = erlang:fun_info(UserFold, arity)
+    WrapFun = case lists:member(include_reductions, DocFoldOpts) of
+        true -> fun(FDI, Acc) -> UserFold(FDI, 0, Acc) end;
+        false -> UserFold
+    end,
+    FoldFun = case lists:member(include_deleted, DocFoldOpts) of
+        true ->
+            WrapFun;
+        false ->
+            fun
+                (#full_doc_info{deleted = true}, Acc) -> {ok, Acc};
+                (#doc{deleted = true}, Acc) -> {ok, Acc};
+                (FDI, Acc) -> WrapFun(FDI, Acc)
+            end
+    end,
+    {ok, LastUserAcc} = fold_docs_int(Step, Stmt, FoldFun, UserAcc),
+    case lists:member(include_reductions, DocFoldOpts) of
+        true -> {ok, 0, LastUserAcc};
+        false -> {ok, LastUserAcc}
+    end.
+
+fold_docs_int('$busy', Stmt, Fun, Acc) ->
+    %% TODO: add resettable retry counter throwing on threshold
+    timer:sleep(100),
+    Step = esqlite3:step(Stmt),
+    fold_docs_int(Step, Stmt, Fun, Acc);
+fold_docs_int('$done', _, _, Acc) ->
+    {ok, Acc};
+fold_docs_int({row, {Row}}, Stmt, Fun, Acc) ->
+    Doc = binary_to_term(Row),
+    case Fun(Doc, Acc) of
+        {stop, NewAcc} ->
+            {ok, NewAcc};
+        {ok, NewAcc} ->
+            Step = esqlite3:step(Stmt),
+            fold_docs_int(Step, Stmt, Fun, NewAcc)
+    end;
+fold_docs_int({error, Error}, _, _, _) ->
+    throw(Error).
+
+
+get_where_query(Opts) ->
+    StartKey = couch_util:get_value(start_key, Opts, null),
+    EndKey = couch_util:get_value(end_key, Opts, null),
+    EndKeyGt = couch_util:get_value(end_key_gt, Opts, null),
+    Dir = couch_util:get_value(dir, Opts, fwd),
+    get_where_query(StartKey, EndKey, EndKeyGt, Dir).
+
+get_where_query(null, null, null, fwd) ->
+    {ok, "order by key asc;", []};
+get_where_query(null, null, null, rev) ->
+    {ok, "order by key desc;", []};
+get_where_query(SK, null, null, fwd) ->
+    {ok, "where key >= ?1 order by key asc;", [SK]};
+get_where_query(SK, null, null, rev) ->
+    {ok, "where key <= ?1 order by key desc;", [SK]};
+get_where_query(null, EK, null, fwd) ->
+    {ok, "where key <= ?1 order by key asc;", [EK]};
+get_where_query(null, EK, null, rev) ->
+    {ok, "where key >= ?1 order by key desc;", [EK]};
+get_where_query(null, null, EK, fwd) ->
+    {ok, "where key < ?1 order by key asc;", [EK]};
+get_where_query(null, null, EK, rev) ->
+    {ok, "where key > ?1 order by key desc;", [EK]};
+get_where_query(SK, EK, null, fwd) ->
+    {ok, "where key >= ?1 and key <= ?2 order by key asc;", [SK, EK]};
+get_where_query(SK, EK, null, rev) ->
+    {ok, "where key <= ?1 and key >= ?2 order by key desc;", [SK, EK]};
+get_where_query(SK, null, EK, fwd) ->
+    {ok, "where key >= ?1 and key < ?2 order by key asc;", [SK, EK]};
+get_where_query(SK, null, EK, rev) ->
+    {ok, "where key <= ?1 and key > ?2 order by key desc;", [SK, EK]}.
 
 % This function may be called by many processes concurrently.
 %
