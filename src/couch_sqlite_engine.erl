@@ -156,7 +156,7 @@ init_state(#st{ref = Ref} = St, Opts) ->
         "create table if not exists meta(key text primary key, value blob);",
         "create table if not exists sec(key text primary key, value blob);",
         "create table if not exists idx(key text primary key, value blob);",
-        "create table if not exists seq(key text primary key, value blob);",
+        "create table if not exists seq(key integer primary key, value blob);",
         "create table if not exists loc(key text primary key, value blob);",
         "create table if not exists doc(key text primary key, value blob);"
     ]),
@@ -724,8 +724,17 @@ get_where_query(SK, null, EK, rev) ->
 %
 % The only option currently supported by the API is the `dir`
 % option that should behave the same as for fold_docs.
-fold_changes(#st{} = _St, _StartSeq, _UserFold, _UserAcc, _ChangesFoldOpts) ->
-    LastUserAcc = [],
+fold_changes(#st{ref = Ref}, StartSeq, UserFold, UserAcc, ChangesFoldOpts) ->
+    Query = case couch_util:get_value(dir, ChangesFoldOpts, fwd) of
+        fwd ->
+            "select value from seq where key >= ?1 order by key asc;";
+        rev ->
+            "select value from seq where key <= ?1 order by key desc;"
+    end,
+    {ok, Stmt} = esqlite3:prepare(Query, Ref),
+    ok = esqlite3:bind(Stmt, [StartSeq + 1]),
+    Step = esqlite3:step(Stmt),
+    {ok, LastUserAcc} = fold_docs_int(Step, Stmt, UserFold, UserAcc),
     {ok, LastUserAcc}.
 
 % This function may be called by many processes concurrently.
@@ -743,8 +752,10 @@ fold_changes(#st{} = _St, _StartSeq, _UserFold, _UserAcc, _ChangesFoldOpts) ->
 % can provide. This may lead to some confusion when interpreting the
 % _active_tasks entry if the storage engine isn't accounted for by the
 % client.
-count_changes_since(#st{} = _St, _UpdateSeq) ->
-    0.
+count_changes_since(#st{ref = Ref}, UpdateSeq) ->
+    Q = "select count(key) from seq where key > ?1 order by key asc;",
+    [{Count}] = esqlite3:q(Q, [UpdateSeq], Ref),
+    Count.
 
 % This function is called in the context of couch_db_updater and as
 % such is guaranteed to be single threaded for the given DbHandle.
