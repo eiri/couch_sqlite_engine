@@ -135,7 +135,8 @@ init(DbPath, DbOpenOpts) ->
     end,
     case esqlite3:open(DbPath) of
         {ok, Ref} ->
-            St = #st{filepath = DbPath, ref = Ref},
+            St = #st{filepath = DbPath, ref = Ref, refc = self()},
+            ok = maybe_track_open_os_files(DbOpenOpts),
             init_state(St, DbOpenOpts);
         {error, Error} ->
             throw(Error)
@@ -148,6 +149,14 @@ init(DbPath, DbOpenOpts) ->
 terminate(_Reason, #st{} = St) ->
     esqlite3:close(St#st.ref),
     ok.
+
+maybe_track_open_os_files(Options) ->
+    case not lists:member(sys_db, Options) of
+        true ->
+            couch_stats_process_tracker:track([couchdb, open_os_files]);
+        false ->
+            ok
+    end.
 
 init_state(#st{ref = Ref} = St, Opts) ->
     %% prepare working tables
@@ -202,14 +211,25 @@ handle_db_updater_info(_Msg, #st{} = St) ->
 % a database. As such they need to be able to handle being
 % called concurrently. For example, the legacy engine uses these
 % to add monitors to the main engine process.
-incref(#st{} = St) ->
-    {ok, St}.
+incref(#st{refc = Refc} = St) ->
+    RefcMon = erlang:monitor(process, Refc),
+    {ok, St#st{refc_monitor = RefcMon}}.
 
-decref(#st{} = _St) ->
+decref(#st{refc_monitor = RefcMon}) ->
+    true = erlang:demonitor(RefcMon, [flush]),
     ok.
 
-monitored_by(#st{} = _St) ->
-    [self()].
+monitored_by(#st{refc = Refc}) ->
+    case erlang:process_info(Refc, monitored_by) of
+        {monitored_by, Pids} ->
+            %% PSE does a strong assumption here,
+            %% that we are always have an external file process
+            %% so it expects us to have +1 monitor here
+            %% (+2 if we also count one process tracker) :/
+            [Refc | Pids];
+        _ ->
+            []
+    end.
 
 % This is called in the context of couch_db_updater:handle_info/2
 % and should return the timestamp of the last activity of

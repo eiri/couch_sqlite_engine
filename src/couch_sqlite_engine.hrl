@@ -13,5 +13,7 @@
 -record(st, {
     filepath,
     ref,
+    refc = 0,
+    refc_monitor,
     meta
 }).
