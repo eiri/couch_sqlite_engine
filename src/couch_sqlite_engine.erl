@@ -167,6 +167,7 @@ init_state(#st{ref = Ref} = St, Opts) ->
         "create table if not exists idx(key text primary key, value blob);",
         "create table if not exists seq(key integer primary key, value blob);",
         "create table if not exists loc(key text primary key, value blob);",
+        "create table if not exists prg(key text primary key, value blob);"
         "create table if not exists doc(key text primary key, value blob);"
     ]),
     ok = esqlite3:exec("commit;", Ref),
@@ -175,6 +176,10 @@ init_state(#st{ref = Ref} = St, Opts) ->
     SecQ = "insert or ignore into sec values(?1, ?2)",
     DSO = couch_util:get_value(default_security_object, Opts, []),
     esqlite3:exec(SecQ, ["sec", term_to_binary(DSO)], Ref),
+
+    %% initial empty purge infos
+    PurgeQ = "insert or ignore into prg values(?1, ?2)",
+    esqlite3:exec(PurgeQ, ["prg", term_to_binary([])], Ref),
 
     %% read or set meta
     case esqlite3:q("select value from meta where key='meta'", Ref) of
@@ -186,6 +191,7 @@ init_state(#st{ref = Ref} = St, Opts) ->
                 {doc_count, 0},
                 {del_doc_count, 0},
                 {update_seq, 0},
+                {purge_seq, 0},
                 {epochs, [{node(), 0}]}
             ],
             MetaQ = "insert or ignore into meta values(?1, ?2)",
@@ -278,13 +284,16 @@ get_epochs(#st{meta = Meta}) ->
     Epochs.
 
 % Get the last purge request performed.
-get_last_purged(#st{} = _St) ->
-    [].
+get_last_purged(#st{ref = Ref}) ->
+    Q = "select value from prg where key='prg';",
+    [{PurgeInfoBin}] = esqlite3:q(Q, Ref),
+    binary_to_term(PurgeInfoBin).
 
 % Get the current purge sequence. This should be incremented
 % for every purge operation.
-get_purge_seq(#st{} = _St) ->
-    0.
+get_purge_seq(#st{meta = Meta}) ->
+    {purge_seq, PurgeSeq} = lists:keyfind(purge_seq, 1, Meta),
+    PurgeSeq.
 
 % Get the revision limit. This should just return the last
 % value that was passed to set_revs_limit/2.
@@ -295,7 +304,7 @@ get_revs_limit(#st{meta = Meta}) ->
 % Get the current security properties. This should just return
 % the last value that was passed to set_security/2.
 get_security(#st{ref = Ref}) ->
-    Q = "select value from sec where key='sec'",
+    Q = "select value from sec where key='sec';",
     [{SecPropsBin}] = esqlite3:q(Q, Ref),
     binary_to_term(SecPropsBin).
 
@@ -474,10 +483,11 @@ write_doc_body(#st{ref = Ref}, #doc{body = {Md5, Data}} = Doc) ->
 % not be an issue as it has never been a guarantee and the
 % batches are non-deterministic (from the point of view of the
 % client).
-write_doc_infos(#st{ref = Ref} = St, Pairs, LocalDocs, _PurgedDocIdRevs) ->
+write_doc_infos(#st{ref = Ref} = St, Pairs, LocalDocs, PurgedDocIdRevs) ->
     DocCount = ?MODULE:get_doc_count(St),
     DelDocCount = ?MODULE:get_del_doc_count(St),
     UpdateSeq = ?MODULE:get_update_seq(St),
+    PurgeSeq = ?MODULE:get_purge_seq(St),
     InsertIdx = "insert into idx values(?1, ?2);",
     InsertSeq = "insert into seq values(?1, ?2);",
     UpdateIdx = "update idx set value = ?2 where key = ?1;",
@@ -498,7 +508,12 @@ write_doc_infos(#st{ref = Ref} = St, Pairs, LocalDocs, _PurgedDocIdRevs) ->
             #full_doc_info{id = DocId, update_seq = OldSeq} = OldFDI,
             esqlite3:exec(DeleteIdx, [DocId], Ref),
             esqlite3:exec(DeleteSeq, [OldSeq], Ref),
-            {DC - 1, DDC + 1, Seq};
+            case OldFDI#full_doc_info.deleted of
+                true ->
+                    {DC, DDC - 1, Seq};
+                false ->
+                    {DC - 1, DDC, Seq}
+            end;
         %% update, delete
         ({OldFDI, NewFDI}, Acc) ->
             {DC, DDC, Seq} = Acc,
@@ -540,12 +555,27 @@ write_doc_infos(#st{ref = Ref} = St, Pairs, LocalDocs, _PurgedDocIdRevs) ->
             end
     end, LocalDocs),
 
+    %% purge
+    NewMetaValues = case PurgedDocIdRevs of
+        [] ->
+            [
+                {doc_count, NewDocCount},
+                {del_doc_count, NewDelDocCount},
+                {update_seq, NewUpdateSeq},
+                {purge_seq, PurgeSeq}
+            ];
+        _ ->
+            UpdatePurge = "update prg set value = ?1 where key = 'prg';",
+            esqlite3:exec(UpdatePurge, [term_to_binary(PurgedDocIdRevs)], Ref),
+            [
+                {doc_count, NewDocCount},
+                {del_doc_count, NewDelDocCount},
+                {update_seq, NewUpdateSeq + 1},
+                {purge_seq, PurgeSeq + 1}
+            ]
+    end,
+
     %% meta
-    NewMetaValues = [
-        {doc_count, NewDocCount},
-        {del_doc_count, NewDelDocCount},
-        {update_seq, NewUpdateSeq}
-    ],
     NewMeta = lists:foldl(fun({Key, Value}, Acc) ->
         lists:keyreplace(Key, 1, Acc, {Key, Value})
     end, St#st.meta, NewMetaValues),
