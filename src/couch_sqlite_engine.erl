@@ -61,6 +61,13 @@
     open_read_stream/2,
     is_active_stream/2,
 
+    %% stream handlers
+    foldl/3,
+    seek/2,
+    write/2,
+    finalize/1,
+    to_disk_term/1,
+
     fold_docs/4,
     fold_local_docs/4,
     fold_changes/5,
@@ -607,22 +614,58 @@ commit_data(#st{ref = Ref, meta = Meta} = St) ->
 % Currently an engine can elect to not implement these API's
 % by throwing the atom not_supported.
 open_write_stream(#st{ref = Ref}, Options) ->
-    StreamEngine = couch_sqlite_engine_stream,
     StreamEngineState = {Ref, []},
-    {ok, Pid} = couch_stream:open({StreamEngine, StreamEngineState}, Options),
+    {ok, Pid} = couch_stream:open({?MODULE, StreamEngineState}, Options),
     {ok, Pid}.
 
 % See the documentation for open_write_stream
 open_read_stream(#st{ref = Ref}, StreamDiskInfo) ->
-    StreamEngine = couch_sqlite_engine_stream,
     StreamEngineState = {Ref, StreamDiskInfo},
-    {ok, {StreamEngine, StreamEngineState}}.
+    {ok, {?MODULE, StreamEngineState}}.
 
 % See the documentation for open_write_stream
-is_active_stream(#st{ref = Ref}, {couch_sqlite_engine_stream, {Ref, _}}) ->
+is_active_stream(#st{ref = Ref}, {?MODULE, {Ref, _}}) ->
     true;
 is_active_stream(_, _) ->
     false.
+
+
+foldl({_Ref, []}, _Fun, Acc) ->
+    Acc;
+
+%% this is a possible first call after a seek on a range fold
+foldl({Ref, [Data | Rest]}, Fun, Acc) when is_binary(Data) ->
+    foldl({Ref, Rest}, Fun, Fun(Data, Acc));
+
+foldl({Ref, [{Oid, _} | Rest]}, Fun, Acc) when is_integer(Oid) ->
+    [{Data}] = esqlite3:q("select value from att where oid = ?1;", [Oid], Ref),
+    foldl({Ref, Rest}, Fun, Fun(Data, Acc)).
+
+
+seek({Ref, [{Oid, Len} | Rest]}, Offset) ->
+    case Len =< Offset of
+        true ->
+            seek({Ref, Rest}, Offset - Len);
+        false ->
+            Data = foldl({Ref, [{Oid, Len}]}, fun(D, _) -> D end, ok),
+            <<_:Offset/binary, Tail/binary>> = Data,
+            {ok, {Ref, [Tail | Rest]}}
+    end.
+
+
+write({Ref, St}, Data) ->
+    '$done' = esqlite3:exec("insert into att values(?1);", [Data], Ref),
+    [{Oid}] =  esqlite3:q("select last_insert_rowid();", Ref),
+    {ok, {Ref, [{Oid, iolist_size(Data)} | St]}}.
+
+
+finalize({Ref, Written}) ->
+    {ok, {Ref, lists:reverse(Written)}}.
+
+
+to_disk_term({_Ref, Written}) ->
+    {ok, Written}.
+
 
 % This funciton is called by many processes concurrently.
 %
