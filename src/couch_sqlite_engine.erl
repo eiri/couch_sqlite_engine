@@ -503,6 +503,7 @@ write_doc_infos(#st{ref = Ref} = St, Pairs, LocalDocs, PurgedDocIdRevs) ->
     UpdateIdx = "update idx set value = ?2 where key = ?1;",
     DeleteIdx = "delete from idx where key = ?1;",
     DeleteSeq = "delete from seq where key = ?1;",
+    ok = esqlite3:exec("begin;", Ref),
     {NewDocCount, NewDelDocCount, NewUpdateSeq} = lists:foldl(fun
         %% create
         ({not_found, NewFDI}, Acc) ->
@@ -584,6 +585,7 @@ write_doc_infos(#st{ref = Ref} = St, Pairs, LocalDocs, PurgedDocIdRevs) ->
                 {purge_seq, PurgeSeq + 1}
             ]
     end,
+    ok = esqlite3:exec("commit;", Ref),
 
     %% meta
     NewMeta = lists:foldl(fun({Key, Value}, Acc) ->
