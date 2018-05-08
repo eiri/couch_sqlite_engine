@@ -169,6 +169,7 @@ init_state(#st{ref = Ref} = St, Opts) ->
         "create table if not exists loc(key text primary key, value blob);",
         "create table if not exists prg(key text primary key, value blob);"
         "create table if not exists doc(key text primary key, value blob);"
+        "create table if not exists att(value blob);"
     ]),
     ok = esqlite3:exec("commit;", Ref),
 
@@ -191,6 +192,7 @@ init_state(#st{ref = Ref} = St, Opts) ->
                 {doc_count, 0},
                 {del_doc_count, 0},
                 {update_seq, 0},
+                {compacted_seq, 0},
                 {purge_seq, 0},
                 {epochs, [{node(), 0}]}
             ],
@@ -252,8 +254,9 @@ last_activity(#st{} = _St) ->
 % The database should make a note of the update sequence when it
 % was last compacted. If the database doesn't need compacting it
 % can just hard code a return value of 0.
-get_compacted_seq(#st{} = _St) ->
-    0.
+get_compacted_seq(#st{meta = Meta}) ->
+    {compacted_seq, CompactedSeq} = lists:keyfind(compacted_seq, 1, Meta),
+    CompactedSeq.
 
 % The number of documents in the database which have all leaf
 % revisions marked as deleted.
@@ -579,16 +582,17 @@ write_doc_infos(#st{ref = Ref} = St, Pairs, LocalDocs, PurgedDocIdRevs) ->
     NewMeta = lists:foldl(fun({Key, Value}, Acc) ->
         lists:keyreplace(Key, 1, Acc, {Key, Value})
     end, St#st.meta, NewMetaValues),
-    UpdateMeta = "update meta set value = ?1 where key = 'meta';",
-    esqlite3:exec(UpdateMeta, [term_to_binary(NewMeta)], Ref),
-    {ok, St#st{meta = NewMeta}}.
+    {ok, NewSt} = ?MODULE:commit_data(St#st{meta = NewMeta}),
+    {ok, NewSt}.
 
 % This function is called in the context of couch_db_udpater and
 % as such is single threaded for any given DbHandle.
 %
 % This call is made periodically to ensure that the database has
 % stored all updates on stable storage. (ie, here is where you fsync).
-commit_data(#st{} = St) ->
+commit_data(#st{ref = Ref, meta = Meta} = St) ->
+    UpdateMeta = "update meta set value = ?1 where key = 'meta';",
+    esqlite3:exec(UpdateMeta, [term_to_binary(Meta)], Ref),
     {ok, St}.
 
 % This function is called by multiple processes concurrently.
@@ -602,17 +606,23 @@ commit_data(#st{} = St) ->
 %
 % Currently an engine can elect to not implement these API's
 % by throwing the atom not_supported.
-open_write_stream(#st{} = _St, _Options) ->
-    {ok, self()}.
+open_write_stream(#st{ref = Ref}, Options) ->
+    StreamEngine = couch_sqlite_engine_stream,
+    StreamEngineState = {Ref, []},
+    {ok, Pid} = couch_stream:open({StreamEngine, StreamEngineState}, Options),
+    {ok, Pid}.
 
 % See the documentation for open_write_stream
-open_read_stream(#st{} = _St, _StreamDiskInfo) ->
-    ReadStreamState = [],
-    {ok, {?MODULE, ReadStreamState}}.
+open_read_stream(#st{ref = Ref}, StreamDiskInfo) ->
+    StreamEngine = couch_sqlite_engine_stream,
+    StreamEngineState = {Ref, StreamDiskInfo},
+    {ok, {StreamEngine, StreamEngineState}}.
 
 % See the documentation for open_write_stream
-is_active_stream(#st{} = _St, _ReadStreamState) ->
-    true.
+is_active_stream(#st{ref = Ref}, {couch_sqlite_engine_stream, {Ref, _}}) ->
+    true;
+is_active_stream(_, _) ->
+    false.
 
 % This funciton is called by many processes concurrently.
 %
@@ -820,8 +830,13 @@ count_changes_since(#st{ref = Ref}, UpdateSeq) ->
 % message to the Parent pid provided. Currently CompactEngine
 % must be the same engine that started the compaction and CompactInfo
 % is an arbitrary term that's passed to finish_compaction/4.
-start_compaction(#st{} = St, _DbName, _Options, _Parent) ->
-    {ok, St, self()}.
+start_compaction(#st{ref = Ref} = St, _DbName, _Options, Parent) ->
+    Pid = spawn(fun() ->
+        UpdateSeq = ?MODULE:get_update_seq(St),
+        ok = esqlite3:exec("vacuum;", Ref),
+        gen_server:cast(Parent, {compact_done, couch_sqlite_engine, UpdateSeq})
+    end),
+    {ok, St, Pid}.
 
 % This function is called in the context of couch_db_udpater and as
 % such is guarnateed to be single threaded for the given DbHandle.
@@ -832,5 +847,16 @@ start_compaction(#st{} = St, _DbName, _Options, _Parent) ->
 % The split in the API here is so that if the storage engine needs
 % to update the DbHandle state of the couch_db_updater it can as
 % finish_compaction/4 is called in the context of the couch_db_updater.
-finish_compaction(#st{} = St, _DbName, _Options, _CompactInfo) ->
-    {ok, St, self()}.
+finish_compaction(#st{meta = Meta} = St0, DbName, Options, OldSeq) ->
+    NewSeq = ?MODULE:get_update_seq(St0),
+    case OldSeq == NewSeq of
+        true ->
+            CS = {compacted_seq, NewSeq},
+            NewMeta = lists:keyreplace(compacted_seq, 1, Meta, CS),
+            {ok, St} = ?MODULE:commit_data(St0#st{meta = NewMeta}),
+            {ok, St, undefined};
+        false ->
+            couch_log:info("Compaction behind (old update seq: ~p, "
+                "new compact update seq: ~p). Retrying.",[OldSeq, NewSeq]),
+            start_compaction(St0, DbName, Options, self())
+    end.
