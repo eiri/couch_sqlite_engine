@@ -830,9 +830,10 @@ count_changes_since(#st{ref = Ref}, UpdateSeq) ->
 % message to the Parent pid provided. Currently CompactEngine
 % must be the same engine that started the compaction and CompactInfo
 % is an arbitrary term that's passed to finish_compaction/4.
-start_compaction(#st{ref = Ref} = St, _DbName, _Options, Parent) ->
+start_compaction(#st{ref = Ref} = St, DbName, _Options, Parent) ->
+    UpdateSeq = ?MODULE:get_update_seq(St),
     Pid = spawn(fun() ->
-        UpdateSeq = ?MODULE:get_update_seq(St),
+        erlang:put(io_priority, {db_compact, DbName}),
         ok = esqlite3:exec("vacuum;", Ref),
         gen_server:cast(Parent, {compact_done, couch_sqlite_engine, UpdateSeq})
     end),
