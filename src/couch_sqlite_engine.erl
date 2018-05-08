@@ -169,28 +169,28 @@ init_state(#st{ref = Ref} = St, Opts) ->
     %% prepare working tables
     ok = esqlite3:exec("begin;", Ref),
     lists:foreach(fun(Q) -> ok = esqlite3:exec(Q, Ref) end, [
-        "create table if not exists meta(key text primary key, value blob);",
-        "create table if not exists sec(key text primary key, value blob);",
+        "create table if not exists meta(value blob);",
+        "create table if not exists sec(value blob);",
         "create table if not exists idx(key text primary key, value blob);",
         "create table if not exists seq(key integer primary key, value blob);",
         "create table if not exists loc(key text primary key, value blob);",
-        "create table if not exists prg(key text primary key, value blob);"
+        "create table if not exists prg(value blob);"
         "create table if not exists doc(key text primary key, value blob);"
         "create table if not exists att(value blob);"
     ]),
     ok = esqlite3:exec("commit;", Ref),
 
     %% maybe update security
-    SecQ = "insert or ignore into sec values(?1, ?2)",
+    SecQ = "insert or ignore into sec (oid, value) values(1, ?1);",
     DSO = couch_util:get_value(default_security_object, Opts, []),
-    esqlite3:exec(SecQ, ["sec", term_to_binary(DSO)], Ref),
+    esqlite3:exec(SecQ, [term_to_binary(DSO)], Ref),
 
     %% initial empty purge infos
-    PurgeQ = "insert or ignore into prg values(?1, ?2)",
-    esqlite3:exec(PurgeQ, ["prg", term_to_binary([])], Ref),
+    PurgeQ = "insert or ignore into prg (oid, value) values(1, ?1);",
+    esqlite3:exec(PurgeQ, [term_to_binary([])], Ref),
 
     %% read or set meta
-    case esqlite3:q("select value from meta where key='meta'", Ref) of
+    case esqlite3:q("select value from meta;", Ref) of
         [] ->
             DefaultMeta = [
                 {disk_version, 1},
@@ -203,8 +203,8 @@ init_state(#st{ref = Ref} = St, Opts) ->
                 {purge_seq, 0},
                 {epochs, [{node(), 0}]}
             ],
-            MetaQ = "insert or ignore into meta values(?1, ?2)",
-            esqlite3:exec(MetaQ, ["meta", term_to_binary(DefaultMeta)], Ref),
+            MetaQ = "insert or ignore into meta (oid, value) values(1, ?1);",
+            esqlite3:exec(MetaQ, [term_to_binary(DefaultMeta)], Ref),
             {ok, St#st{meta = DefaultMeta}};
         [{MetaBin}] ->
             Meta = binary_to_term(MetaBin),
@@ -295,7 +295,7 @@ get_epochs(#st{meta = Meta}) ->
 
 % Get the last purge request performed.
 get_last_purged(#st{ref = Ref}) ->
-    Q = "select value from prg where key='prg';",
+    Q = "select value from prg;",
     [{PurgeInfoBin}] = esqlite3:q(Q, Ref),
     binary_to_term(PurgeInfoBin).
 
@@ -314,7 +314,7 @@ get_revs_limit(#st{meta = Meta}) ->
 % Get the current security properties. This should just return
 % the last value that was passed to set_security/2.
 get_security(#st{ref = Ref}) ->
-    Q = "select value from sec where key='sec';",
+    Q = "select value from sec;",
     [{SecPropsBin}] = esqlite3:q(Q, Ref),
     binary_to_term(SecPropsBin).
 
@@ -355,12 +355,12 @@ get_uuid(#st{meta = Meta}) ->
 
 set_revs_limit(#st{ref = Ref, meta = Meta0} = St, RevsLimit) ->
     Meta = lists:keyreplace(revs_limit, 1, Meta0, {revs_limit, RevsLimit}),
-    Q = "update meta set value = ?1 where key = 'meta';",
+    Q = "update meta set value = ?1;",
     '$done' = esqlite3:exec(Q, [term_to_binary(Meta)], Ref),
     {ok, St#st{meta = Meta}}.
 
 set_security(#st{ref = Ref} = St, SecProps) ->
-    Q = "update sec set value = ?1 where key = 'sec';",
+    Q = "update sec set value = ?1;",
     '$done' = esqlite3:exec(Q, [term_to_binary(SecProps)], Ref),
     {ok, St}.
 
@@ -575,7 +575,7 @@ write_doc_infos(#st{ref = Ref} = St, Pairs, LocalDocs, PurgedDocIdRevs) ->
                 {purge_seq, PurgeSeq}
             ];
         _ ->
-            UpdatePurge = "update prg set value = ?1 where key = 'prg';",
+            UpdatePurge = "update prg set value = ?1;",
             esqlite3:exec(UpdatePurge, [term_to_binary(PurgedDocIdRevs)], Ref),
             [
                 {doc_count, NewDocCount},
@@ -598,7 +598,7 @@ write_doc_infos(#st{ref = Ref} = St, Pairs, LocalDocs, PurgedDocIdRevs) ->
 % This call is made periodically to ensure that the database has
 % stored all updates on stable storage. (ie, here is where you fsync).
 commit_data(#st{ref = Ref, meta = Meta} = St) ->
-    UpdateMeta = "update meta set value = ?1 where key = 'meta';",
+    UpdateMeta = "update meta set value = ?1;",
     esqlite3:exec(UpdateMeta, [term_to_binary(Meta)], Ref),
     {ok, St}.
 
