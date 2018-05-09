@@ -333,8 +333,15 @@ get_security(#st{ref = Ref}) ->
 %   external - Number of bytes that would be required to represent the
 %              contents outside of the database (for capacity and backup
 %              planning)
-get_size_info(#st{} = _St) ->
-    [{file, 0}, {active, 0}, {external, 0}].
+get_size_info(#st{ref = Ref} = St) ->
+    FileSize = filelib:file_size(St#st.filepath),
+    [{ActiveSize}] = esqlite3:q("select sum(payload) from dbstat;", Ref),
+    DocQ = "select coalesce(sum(length(value)), 0) from doc;",
+    [{DocsSize}] = esqlite3:q(DocQ, Ref),
+    AttQ = "select coalesce(sum(length(value)), 0) from att;",
+    [{AttsSize}] = esqlite3:q(AttQ, Ref),
+    ExternalSize = DocsSize + AttsSize,
+    [{file, FileSize}, {active, ActiveSize}, {external, ExternalSize}].
 
 % The current update sequence of the database. The update
 % sequence should be incrememnted for every revision added to
