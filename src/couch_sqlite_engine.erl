@@ -356,15 +356,25 @@ get_uuid(#st{meta = Meta}) ->
 % they can be returned by the corresponding get_* calls.
 
 set_revs_limit(#st{ref = Ref, meta = Meta0} = St, RevsLimit) ->
-    Meta = lists:keyreplace(revs_limit, 1, Meta0, {revs_limit, RevsLimit}),
+    Meta1 = lists:keyreplace(revs_limit, 1, Meta0, {revs_limit, RevsLimit}),
+    Meta = increment_update_seq(St#st{meta = Meta1}),
     Q = "update meta set value = ?1;",
     '$done' = esqlite3:exec(Q, [term_to_binary(Meta)], Ref),
     {ok, St#st{meta = Meta}}.
 
 set_security(#st{ref = Ref} = St, SecProps) ->
-    Q = "update sec set value = ?1;",
-    '$done' = esqlite3:exec(Q, [term_to_binary(SecProps)], Ref),
-    {ok, St}.
+    ok = esqlite3:exec("begin;", Ref),
+    QSec = "update sec set value = ?1;",
+    '$done' = esqlite3:exec(QSec, [term_to_binary(SecProps)], Ref),
+    Meta = increment_update_seq(St),
+    QMeta = "update meta set value = ?1;",
+    '$done' = esqlite3:exec(QMeta, [term_to_binary(Meta)], Ref),
+    ok = esqlite3:exec("commit;", Ref),
+    {ok, St#st{meta = Meta}}.
+
+increment_update_seq(#st{meta = Meta0} = St) ->
+    UpdateSeq = ?MODULE:get_update_seq(St),
+    lists:keyreplace(update_seq, 1, Meta0, {update_seq, UpdateSeq + 1}).
 
 % This function will be called by many processes concurrently.
 % It should return a #full_doc_info{} record or not_found for
