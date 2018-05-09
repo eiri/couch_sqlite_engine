@@ -180,7 +180,6 @@ init_state(#st{ref = Ref} = St, Opts) ->
         "create table if not exists doc(key text primary key, value blob);"
         "create table if not exists att(value blob);"
     ]),
-    ok = esqlite3:exec("commit;", Ref),
 
     %% maybe update security
     SecQ = "insert or ignore into sec (oid, value) values(1, ?1);",
@@ -192,7 +191,7 @@ init_state(#st{ref = Ref} = St, Opts) ->
     esqlite3:exec(PurgeQ, [term_to_binary([])], Ref),
 
     %% read or set meta
-    case esqlite3:q("select value from meta;", Ref) of
+    Meta = case esqlite3:q("select value from meta;", Ref) of
         [] ->
             DefaultMeta = [
                 {disk_version, 1},
@@ -207,11 +206,12 @@ init_state(#st{ref = Ref} = St, Opts) ->
             ],
             MetaQ = "insert or ignore into meta (oid, value) values(1, ?1);",
             esqlite3:exec(MetaQ, [term_to_binary(DefaultMeta)], Ref),
-            {ok, St#st{meta = DefaultMeta}};
+            DefaultMeta;
         [{MetaBin}] ->
-            Meta = binary_to_term(MetaBin),
-            {ok, St#st{meta = Meta}}
-    end.
+            binary_to_term(MetaBin)
+    end,
+    ok = esqlite3:exec("commit;", Ref),
+    {ok, St#st{meta = Meta}}.
 
 % This is called in the context of couch_db_updater:handle_call/3
 % for any message that is unknown. It can be used to handle messages
