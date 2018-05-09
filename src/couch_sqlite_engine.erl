@@ -166,6 +166,8 @@ maybe_track_open_os_files(Options) ->
     end.
 
 init_state(#st{ref = Ref} = St, Opts) ->
+    ok = esqlite3:exec("pragma journal_mode = WAL;", Ref),
+    ok = esqlite3:exec("pragma synchronous = NORMAL;", Ref),
     %% prepare working tables
     ok = esqlite3:exec("begin;", Ref),
     lists:foreach(fun(Q) -> ok = esqlite3:exec(Q, Ref) end, [
